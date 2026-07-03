@@ -18,8 +18,9 @@ x=outtrap('z.'); "DELETE '"outds"'"; x=outtrap('off')
    "RECFM(F B) LRECL(133) DSORG(PS)"
 if rc <> 0 then "ALLOC FI(OUT) DA('"outds"') SHR"
 h.1 = left('LIBRERIA',25) left('MIEMBRO',9) left('TIPO',8),
-      left('COMPIL',10) left('F.COMPIL',11) left('F.CREACION',11) 'HORA'
-h.2 = copies('-',85)
+      left('COMPIL',10) left('F.COMPILA',11),
+      left('F.CREA-BIND',11) 'HORA-BIND'
+h.2 = copies('-',86)
 "EXECIO 2 DISKW OUT (STEM h."
 
 ktot=0
@@ -43,7 +44,7 @@ do s = 1 by 1
          end
          when pos('LIBRARY:',u) > 0 & lib = '' then do
             parse var u 'LIBRARY:' w
-            lib=strip(w)
+            lib=word(w,1)
          end
          when pos('PROGRAM OBJECT PROCESSED BY BINDER',u) > 0 then tipo='PGMOBJ'
          when pos('LOAD MODULE PROCESSED EITHER',u)      > 0 then tipo='LOADMOD'
@@ -80,6 +81,7 @@ do s = 1 by 1
    say 'SET's':' l.0 'lineas ->' k 'objetos'
    drop l. o.
 end
+"EXECIO 0 DISKW OUT (FINIS"
 "FREE FI(OUT)"
 if ktot = 0 then do; say 'No se leyo ningun RPT.SETn'; exit 8; end
 say '=== TOTAL' ktot 'objetos ->' outds
@@ -93,8 +95,8 @@ resetvars:
 emit:
    if mem = '' then return
    k=k+1
-   libn=lib
-   if symbol('MAP.'lib) = 'VAR' then libn=map.lib
+   libn = map.lib
+   if libn = "MAP."lib then libn = lib
    if bdate <> '' then do; fc=bdate; hr=btime; end
    else do; fc=cdate; hr='(s/hora)'; end
    if hr = '' then hr='(s/hora)'
