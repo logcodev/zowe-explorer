@@ -1,7 +1,7 @@
 /* REXX PARSEIDR - inventario robusto (PDS load mod y PDSE pgm obj) */
-parse arg rptds outds
-if rptds = '' then rptds = "T53167.AMBLIST.RPT"
+parse arg outds pfx
 if outds = '' then outds = "T53167.AMBLIST.INVENT"
+if pfx   = '' then pfx = "T53167.AMBLIST"
 
 map.LOAD1 = "ENDVC.BCBGN.LOADBA"
 map.LOAD2 = "ENDVC.BCBGN.LOADTP"
@@ -12,10 +12,24 @@ map.LOAD6 = "ENDVC.CORPGN.LOADTP"
 map.LOAD7 = "ENDVC.CORPGN.PDSE.LOADBA"
 map.LOAD8 = "ENDVC.CORPGN.PDSE.LOADTP"
 
-"ALLOC FI(IN) DA('"rptds"') SHR"
-"EXECIO * DISKR IN (STEM l. FINIS"
-"FREE FI(IN)"
+/* --- lee todos los RPT.SETn que existan --- */
+l.0 = 0
+do s = 1 by 1
+   ds = pfx".RPT.SET"s
+   x=outtrap('t.'); "ALLOC FI(IN) DA('"ds"') SHR"; arc=rc; x=outtrap('off')
+   if arc <> 0 then leave
+   "EXECIO * DISKR IN (STEM p. FINIS"
+   "FREE FI(IN)"
+   base=l.0
+   do a=1 to p.0
+      l.base+a = p.a
+   end
+   l.0 = base + p.0
+   say 'leido' ds '('p.0' lineas)'
+end
+if l.0 = 0 then do; say 'No hay' pfx'.RPT.SETn'; exit 8; end
 
+/* --- parseo --- */
 o.=0; k=0
 mem=''; lib=''; xlat=''; cdate=''; bdate=''; btime=''; want=0; gotc=0
 
@@ -57,6 +71,7 @@ end
 call emit
 o.0=k
 
+/* --- salida --- */
 h.1 = left('LIBRERIA',25) left('MIEMBRO',9) left('COMPIL',10),
       left('F.COMPIL',11) left('F.CREACION',11) 'HORA'
 h.2 = copies('-',78)
