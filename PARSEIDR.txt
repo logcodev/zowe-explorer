@@ -22,7 +22,8 @@ do s = 1 by 1
    "FREE FI(IN)"
    base=l.0
    do a=1 to p.0
-      l.base+a = p.a
+      idx = base + a
+      l.idx = p.a
    end
    l.0 = base + p.0
    say 'leido' ds '('p.0' lineas)'
