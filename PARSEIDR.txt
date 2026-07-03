@@ -1,4 +1,4 @@
-/* REXX PARSEIDR - procesa set por set (bajo consumo de memoria) */
+/* REXX PARSEIDR - procesa set por set, fechas en DD/MM/YYYY */
 parse arg outds pfx
 if outds = '' then outds = "T53167.AMBLIST.INVENT"
 if pfx   = '' then pfx = "T53167.AMBLIST"
@@ -12,7 +12,6 @@ map.LOAD6 = "ENDVC.CORPGN.LOADTP"
 map.LOAD7 = "ENDVC.CORPGN.PDSE.LOADBA"
 map.LOAD8 = "ENDVC.CORPGN.PDSE.LOADTP"
 
-/* abre el output una vez y va escribiendo por set */
 x=outtrap('z.'); "DELETE '"outds"'"; x=outtrap('off')
 "ALLOC FI(OUT) DA('"outds"') NEW CATALOG SPACE(30,15) TRACKS",
    "RECFM(F B) LRECL(133) DSORG(PS)"
@@ -51,7 +50,7 @@ do s = 1 by 1
          when pos('ORIGINALLY PRODUCED BY',u) > 0 then do
             parse var u ' ON ' r
             parse var r d ' AT ' t
-            bdate=strip(d); btime=notrail(strip(t))
+            bdate=usa2ddmm(strip(d)); btime=notrail(strip(t))
          end
          when pos('PRODUCED BY THE BINDER',u) > 0 then do
             parse var u 'ON DAY ' jd ' OF YEAR ' jy ' AT ' jt
@@ -109,6 +108,13 @@ notrail: procedure
    if right(s,1) = '.' then s=left(s,length(s)-1)
    return strip(s)
 
+usa2ddmm: procedure
+   parse arg s
+   if length(s)=10 then
+      if substr(s,3,1)='/' & substr(s,6,1)='/' then
+         return substr(s,4,2)'/'left(s,2)'/'right(s,4)
+   return s
+
 istid: procedure
    parse arg s
    if length(s) < 5 | length(s) > 9 then return 0
@@ -122,13 +128,14 @@ normdate: procedure
    if length(s) = 10 then do
       if substr(s,3,1)='/' & substr(s,6,1)='/' then do
          mm=left(s,2); dd=substr(s,4,2); yy=right(s,4)
-         if datatype(mm,'W') & datatype(dd,'W') & datatype(yy,'W') then return s
+         if datatype(mm,'W') & datatype(dd,'W') & datatype(yy,'W') then,
+            return dd'/'mm'/'yy
       end
    end
    if length(s) = 8 then do
       if substr(s,5,1)='/' then do
          yy=left(s,4); ddd=right(s,3)
-         if datatype(yy,'W') & datatype(ddd,'W') then
+         if datatype(yy,'W') & datatype(ddd,'W') then,
             if yy > 1900 & ddd >= 1 & ddd <= 366 then return j2greg(yy,ddd)
       end
    end
@@ -144,4 +151,4 @@ j2greg: procedure
    do while d > md.mo
       d = d - md.mo; mo = mo + 1
    end
-   return right(mo,2,'0')'/'right(d,2,'0')'/'yyyy
+   return right(d,2,'0')'/'right(mo,2,'0')'/'yyyy
