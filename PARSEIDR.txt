@@ -1,0 +1,89 @@
+/* REXX PARSEIDR - inventario robusto (PDS load mod y PDSE pgm obj) */
+parse arg rptds outds
+if rptds = '' then rptds = "T53167.AMBLIST.RPT"
+if outds = '' then outds = "T53167.AMBLIST.INVENT"
+
+map.LOAD1 = "ENDVC.BCBGN.LOADBA"
+map.LOAD2 = "ENDVC.BCBGN.LOADTP"
+map.LOAD3 = "ENDVC.BCBGN.PDSE.LOADBA"
+map.LOAD4 = "ENDVC.BCBGN.PDSE.LOADTP"
+map.LOAD5 = "ENDVC.CORPGN.LOADBA"
+map.LOAD6 = "ENDVC.CORPGN.LOADTP"
+map.LOAD7 = "ENDVC.CORPGN.PDSE.LOADBA"
+map.LOAD8 = "ENDVC.CORPGN.PDSE.LOADTP"
+
+"ALLOC FI(IN) DA('"rptds"') SHR"
+"EXECIO * DISKR IN (STEM l. FINIS"
+"FREE FI(IN)"
+
+o.=0; k=0
+mem=''; lib=''; xlat=''; cdate=''; bdate=''; btime=''; want=0; gotc=0
+
+do i=1 to l.0
+   u = translate(strip(substr(l.i,2)))     /* quita el ASA de col 1 */
+   select
+      when pos('MEMBER NAME:',u) > 0 then do
+         call emit
+         parse var u 'MEMBER NAME:' w
+         mem=strip(w); lib=''; xlat=''; cdate=''
+         bdate=''; btime=''; want=0; gotc=0
+      end
+      when pos('LIBRARY:',u) > 0 & lib = '' then do
+         parse var u 'LIBRARY:' w
+         lib=strip(w)
+      end
+      when pos('ORIGINALLY PRODUCED BY',u) > 0 then do
+         parse var u ' ON ' r
+         parse var r d ' AT ' t
+         bdate=strip(d); btime=strip(t)
+      end
+      when pos('CSECT:',u) > 0 then do
+         if gotc = 0 then want=1
+      end
+      when want = 1 then do
+         if words(u) >= 2 & \isdate(word(u,1)) then do
+            dt=''
+            do w=2 to words(u)
+               if isdate(word(u,w)) then do; dt=word(u,w); leave; end
+            end
+            if dt <> '' then do
+               xlat=word(u,1); cdate=dt; want=0; gotc=1
+            end
+         end
+      end
+      otherwise nop
+   end
+end
+call emit
+o.0=k
+
+h.1 = left('LIBRERIA',25) left('MIEMBRO',9) left('COMPIL',10),
+      left('F.COMPIL',11) left('F.CREACION',11) 'HORA'
+h.2 = copies('-',78)
+x=outtrap('z.'); "DELETE '"outds"'"; x=outtrap('off')
+"ALLOC FI(OUT) DA('"outds"') NEW CATALOG SPACE(5,5) TRACKS",
+   "RECFM(F B) LRECL(133) DSORG(PS)"
+if rc <> 0 then "ALLOC FI(OUT) DA('"outds"') SHR"
+"EXECIO 2 DISKW OUT (STEM h."
+"EXECIO "o.0" DISKW OUT (STEM o. FINIS"
+"FREE FI(OUT)"
+say k 'objetos ->' outds
+do i=1 to min(k,12); say o.i; end
+exit 0
+
+emit:
+   if mem = '' then return
+   k=k+1
+   libn=lib
+   if symbol('MAP.'lib) = 'VAR' then libn=map.lib
+   if bdate <> '' then do; fc=bdate; hr=btime; end
+   else do; fc=cdate; hr='(load mod)'; end
+   o.k = left(libn,25) left(mem,9) left(xlat,10),
+         left(cdate,11) left(fc,11) hr
+   return
+
+isdate: procedure
+   parse arg s
+   if length(s) <> 10 then return 0
+   if substr(s,3,1) = '/' & substr(s,6,1) = '/' then return 1
+   return 0
