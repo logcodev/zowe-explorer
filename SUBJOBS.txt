@@ -1,0 +1,40 @@
+/* REXX SUBJOBS - submite N jobs AMBLIST via internal reader */
+parse arg nset pfx
+if nset = '' then do; say 'Uso: EX SUBJOBS nset'; exit 8; end
+if pfx  = '' then pfx = "T53167.AMBLIST"
+
+do s=1 to nset
+   set = "SET"s
+   jn  = "T53167"right(s,2,'0')     /* T5316701 .. T5316799  (8 chars) */
+   j.=0
+   call put "//"jn" JOB (ACCT),'AMB "set"',CLASS=A,MSGCLASS=X,NOTIFY=&SYSUID"
+   call put "//DEL   EXEC PGM=IDCAMS"
+   call put "//SYSPRINT DD SYSOUT=*"
+   call put "//SYSIN DD *"
+   call put "  DELETE "pfx".RPT."set
+   call put "  SET MAXCC=0"
+   call put "/*"
+   call put "//AMB   EXEC PGM=AMBLIST,REGION=0M"
+   call put "//SYSPRINT DD DSN="pfx".RPT."set",DISP=(,CATLG),"
+   call put "//   SPACE=(CYL,(60,30),RLSE),UNIT=(SYSDA,3),"
+   call put "//   DCB=(RECFM=FBA,LRECL=121,BLKSIZE=0)"
+   call put "//LOAD1 DD DISP=SHR,DSN=ENDVC.BCBGN.LOADBA"
+   call put "//LOAD2 DD DISP=SHR,DSN=ENDVC.BCBGN.LOADTP"
+   call put "//LOAD3 DD DISP=SHR,DSN=ENDVC.BCBGN.PDSE.LOADBA"
+   call put "//LOAD4 DD DISP=SHR,DSN=ENDVC.BCBGN.PDSE.LOADTP"
+   call put "//LOAD5 DD DISP=SHR,DSN=ENDVC.CORPGN.LOADBA"
+   call put "//LOAD6 DD DISP=SHR,DSN=ENDVC.CORPGN.LOADTP"
+   call put "//LOAD7 DD DISP=SHR,DSN=ENDVC.CORPGN.PDSE.LOADBA"
+   call put "//LOAD8 DD DISP=SHR,DSN=ENDVC.CORPGN.PDSE.LOADTP"
+   call put "//SYSIN DD DISP=SHR,DSN="pfx".SYSIN."set
+   "ALLOC FI(RDR) SYSOUT(A) WRITER(INTRDR) RECFM(F B) LRECL(80)"
+   "EXECIO "j.0" DISKW RDR (STEM j. FINIS"
+   "FREE FI(RDR)"
+   say 'Enviado' jn '->' set
+end
+say '===' nset 'jobs submitidos'
+exit 0
+
+put:
+   n=j.0+1; j.n=arg(1); j.0=n
+   return
