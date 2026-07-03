@@ -1,4 +1,4 @@
-/* REXX PARSEIDR - inventario: PGMOBJ (gregoriano) y LOADMOD (juliano) */
+/* REXX PARSEIDR - procesa set por set (bajo consumo de memoria) */
 parse arg outds pfx
 if outds = '' then outds = "T53167.AMBLIST.INVENT"
 if pfx   = '' then pfx = "T53167.AMBLIST"
@@ -12,85 +12,77 @@ map.LOAD6 = "ENDVC.CORPGN.LOADTP"
 map.LOAD7 = "ENDVC.CORPGN.PDSE.LOADBA"
 map.LOAD8 = "ENDVC.CORPGN.PDSE.LOADTP"
 
-/* --- lee todos los RPT.SETn que existan --- */
-l.0 = 0
+/* abre el output una vez y va escribiendo por set */
+x=outtrap('z.'); "DELETE '"outds"'"; x=outtrap('off')
+"ALLOC FI(OUT) DA('"outds"') NEW CATALOG SPACE(30,15) TRACKS",
+   "RECFM(F B) LRECL(133) DSORG(PS)"
+if rc <> 0 then "ALLOC FI(OUT) DA('"outds"') SHR"
+h.1 = left('LIBRERIA',25) left('MIEMBRO',9) left('TIPO',8),
+      left('COMPIL',10) left('F.COMPIL',11) left('F.CREACION',11) 'HORA'
+h.2 = copies('-',85)
+"EXECIO 2 DISKW OUT (STEM h."
+
+ktot=0
 do s = 1 by 1
    ds = pfx".RPT.SET"s
    x=outtrap('t.'); "ALLOC FI(IN) DA('"ds"') SHR"; arc=rc; x=outtrap('off')
    if arc <> 0 then leave
-   "EXECIO * DISKR IN (STEM p. FINIS"
+   "EXECIO * DISKR IN (STEM l. FINIS"
    "FREE FI(IN)"
-   base=l.0
-   do a=1 to p.0
-      idx = base + a
-      l.idx = p.a
+
+   o.=0; k=0
+   call resetvars
+   do i=1 to l.0
+      u = translate(strip(substr(l.i,2)))
+      select
+         when pos('MEMBER NAME:',u) > 0 then do
+            call emit
+            call resetvars
+            parse var u 'MEMBER NAME:' w
+            mem=strip(w)
+         end
+         when pos('LIBRARY:',u) > 0 & lib = '' then do
+            parse var u 'LIBRARY:' w
+            lib=strip(w)
+         end
+         when pos('PROGRAM OBJECT PROCESSED BY BINDER',u) > 0 then tipo='PGMOBJ'
+         when pos('LOAD MODULE PROCESSED EITHER',u)      > 0 then tipo='LOADMOD'
+         when pos('ORIGINALLY PRODUCED BY',u) > 0 then do
+            parse var u ' ON ' r
+            parse var r d ' AT ' t
+            bdate=strip(d); btime=notrail(strip(t))
+         end
+         when pos('PRODUCED BY THE BINDER',u) > 0 then do
+            parse var u 'ON DAY ' jd ' OF YEAR ' jy ' AT ' jt
+            jd=strip(jd); jy=strip(jy); jt=notrail(strip(jt))
+            if datatype(jd,'W') & datatype(jy,'W') then do
+               bdate=j2greg(jy,jd); btime=jt
+            end
+         end
+         when pos('TRANSLATOR',u) > 0 then tflag=1
+         when tflag = 1 then do
+            if xlat = '' then do w=1 to words(u)
+               if istid(word(u,w)) then do; xlat=word(u,w); leave; end
+            end
+            if cdate = '' then do w=1 to words(u)
+               nd=normdate(word(u,w))
+               if nd <> '' then do; cdate=nd; leave; end
+            end
+            if xlat <> '' & cdate <> '' then tflag=0
+         end
+         otherwise nop
+      end
    end
-   l.0 = base + p.0
-   say 'leido' ds '('p.0' lineas)'
+   call emit
+   o.0=k
+   if k > 0 then "EXECIO "k" DISKW OUT (STEM o."
+   ktot = ktot + k
+   say 'SET's':' l.0 'lineas ->' k 'objetos'
+   drop l. o.
 end
-if l.0 = 0 then do; say 'No hay' pfx'.RPT.SETn'; exit 8; end
-
-/* --- parseo --- */
-o.=0; k=0
-call resetvars
-
-do i=1 to l.0
-   u = translate(strip(substr(l.i,2)))     /* quita ASA col 1, upper */
-   select
-      when pos('MEMBER NAME:',u) > 0 then do
-         call emit
-         call resetvars
-         parse var u 'MEMBER NAME:' w
-         mem=strip(w)
-      end
-      when pos('LIBRARY:',u) > 0 & lib = '' then do
-         parse var u 'LIBRARY:' w
-         lib=strip(w)
-      end
-      when pos('PROGRAM OBJECT PROCESSED BY BINDER',u) > 0 then tipo='PGMOBJ'
-      when pos('LOAD MODULE PROCESSED EITHER',u)      > 0 then tipo='LOADMOD'
-      when pos('ORIGINALLY PRODUCED BY',u) > 0 then do
-         parse var u ' ON ' r
-         parse var r d ' AT ' t
-         bdate=strip(d); btime=notrail(strip(t))
-      end
-      when pos('PRODUCED BY THE BINDER',u) > 0 then do
-         parse var u 'ON DAY ' jd ' OF YEAR ' jy ' AT ' jt
-         jd=strip(jd); jy=strip(jy); jt=notrail(strip(jt))
-         if datatype(jd,'W') & datatype(jy,'W') then do
-            bdate=j2greg(jy,jd); btime=jt
-         end
-      end
-      when pos('TRANSLATOR',u) > 0 then tflag=1
-      when tflag = 1 then do
-         if xlat = '' then do w=1 to words(u)
-            if istid(word(u,w)) then do; xlat=word(u,w); leave; end
-         end
-         if cdate = '' then do w=1 to words(u)
-            nd=normdate(word(u,w))
-            if nd <> '' then do; cdate=nd; leave; end
-         end
-         if xlat <> '' & cdate <> '' then tflag=0
-      end
-      otherwise nop
-   end
-end
-call emit
-o.0=k
-
-/* --- salida --- */
-h.1 = left('LIBRERIA',25) left('MIEMBRO',9) left('TIPO',8),
-      left('COMPIL',10) left('F.COMPIL',11) left('F.CREACION',11) 'HORA'
-h.2 = copies('-',85)
-x=outtrap('z.'); "DELETE '"outds"'"; x=outtrap('off')
-"ALLOC FI(OUT) DA('"outds"') NEW CATALOG SPACE(5,5) TRACKS",
-   "RECFM(F B) LRECL(133) DSORG(PS)"
-if rc <> 0 then "ALLOC FI(OUT) DA('"outds"') SHR"
-"EXECIO 2 DISKW OUT (STEM h."
-"EXECIO "o.0" DISKW OUT (STEM o. FINIS"
 "FREE FI(OUT)"
-say k 'objetos ->' outds
-do i=1 to min(k,12); say o.i; end
+if ktot = 0 then do; say 'No se leyo ningun RPT.SETn'; exit 8; end
+say '=== TOTAL' ktot 'objetos ->' outds
 exit 0
 
 resetvars:
