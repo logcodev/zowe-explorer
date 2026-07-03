@@ -1,0 +1,45 @@
+/* REXX GENALL - arma SYSIN de AMBLIST para las 8 loadlibs */
+parse arg sysinds
+if sysinds = '' then sysinds = "T53167.AMBLIST.SYSIN"
+
+lib.1 = "LOAD1 ENDVC.BCBGN.LOADBA"
+lib.2 = "LOAD2 ENDVC.BCBGN.LOADTP"
+lib.3 = "LOAD3 ENDVC.BCBGN.PDSE.LOADBA"
+lib.4 = "LOAD4 ENDVC.BCBGN.PDSE.LOADTP"
+lib.5 = "LOAD5 ENDVC.CORPGN.LOADBA"
+lib.6 = "LOAD6 ENDVC.CORPGN.LOADTP"
+lib.7 = "LOAD7 ENDVC.CORPGN.PDSE.LOADBA"
+lib.8 = "LOAD8 ENDVC.CORPGN.PDSE.LOADTP"
+lib.0 = 8
+
+c.=0; n=0
+do j=1 to lib.0
+   parse var lib.j ddn dsn .
+   x=outtrap('m.')
+   "LISTDS '"dsn"' MEMBERS"
+   lrc=rc
+   x=outtrap('off')
+   if lrc <> 0 then do
+      say 'AVISO: LISTDS fallo' dsn 'rc='lrc '(omitida)'
+      iterate
+   end
+   go=0; cnt=0
+   do i=1 to m.0
+      ln=strip(m.i)
+      if ln = '--MEMBERS--' then do; go=1; iterate; end
+      if go & ln <> '' then do
+         n=n+1; cnt=cnt+1
+         c.n="  LISTIDR DDN="ddn",MEMBER="word(ln,1)
+      end
+   end
+   say left(dsn,28) ddn cnt 'miembros'
+end
+c.0=n
+x=outtrap('z.'); "DELETE '"sysinds"'"; x=outtrap('off')
+"ALLOC FI(GO) DA('"sysinds"') NEW CATALOG SPACE(5,5) TRACKS",
+   "RECFM(F B) LRECL(80) DSORG(PS)"
+if rc <> 0 then "ALLOC FI(GO) DA('"sysinds"') SHR"
+"EXECIO "c.0" DISKW GO (STEM c. FINIS"
+"FREE FI(GO)"
+say '---' n 'tarjetas ->' sysinds
+exit 0
