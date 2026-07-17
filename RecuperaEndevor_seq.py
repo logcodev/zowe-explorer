@@ -4,7 +4,7 @@ RecuperaEndevor_seq.py - Inventario de elementos Endevor via Zowe CLI -> CSV
                          VERSION SECUENCIAL: una consulta a la vez.
 
 Autor   : Albert Tapia
-Version : 9.0
+Version : 10.0
 
 El input es una lista de NOMBRES DE ELEMENTO. El TYPE es un dato a
 descubrir, no un filtro: se consulta con --typ * y se reporta lo que venga.
@@ -19,9 +19,11 @@ Al arrancar pregunta por el ambiente:
 El prompt sale por stderr, asi que puedes responderlo con un pipe:
     echo 2 | python RecuperaEndevor_seq.py lista.txt
 
+Siempre escribe un .csv; nada de volcar el CSV a la terminal.
+
 Uso:
-    RecuperaEndevor_seq.py <archivo_input> [salida.csv]
-    RecuperaEndevor_seq.py <ELEMENT>
+    RecuperaEndevor_seq.py <archivo_input> [salida.csv]  -> lista_<fecha>.csv
+    RecuperaEndevor_seq.py <ELEMENT>            -> ELEMENT_<fecha>.csv
 
 Variables de entorno opcionales:
     ENDEVOR_TYPE            (default: *)   filtro de type, si lo conoces
@@ -45,9 +47,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from collections import OrderedDict, defaultdict
 from datetime import datetime
-from os.path import basename, isfile, splitext
+from os.path import abspath, basename, isfile, splitext
 
 # El JSON de --rfj trae decenas de campos por elemento; estos son los que
 # van al CSV. (clave JSON, columna). Editar aqui es editar todo.
@@ -88,6 +92,67 @@ ISO_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})")
 # aqui cada nombre se cruza 1:1 contra la respuesta, y una mascara no
 # tendria contra que cruzarse.
 FIELD_RE = re.compile(r"^[A-Za-z0-9$#@._-]+$")
+
+
+PRINT_LOCK = threading.Lock()
+
+# Un solo formato para la cabecera, el cronometro en vivo y la fila final:
+# asi no se pueden desalinear entre si.
+LINE = "  {n:>7}  {el:<10} {filas:>5} {tiempo:>8}"
+
+
+def rule() -> str:
+    return LINE.format(n="-" * 7, el="-" * 10, filas="-" * 5, tiempo="-" * 8)
+
+
+def header() -> str:
+    return LINE.format(n="#", el="ELEMENTO", filas="FILAS",
+                       tiempo="TIEMPO") + "\n" + rule()
+
+
+class Ticker:
+    """Cronometro en vivo. Reescribe una unica linea con \r (sin scroll),
+    con la misma forma que tendra la fila final."""
+
+    def __init__(self, n: str, el: str):
+        self.n, self.el = n, el
+        self.started = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+        self._thread.start()
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def _tick(self) -> None:
+        while not self._stop.wait(0.1):
+            with PRINT_LOCK:
+                sys.stderr.write("\r" + LINE.format(
+                    n=self.n, el=self.el, filas="",
+                    tiempo=f"{self.elapsed:.1f}s"))
+                sys.stderr.flush()
+
+    def clear(self) -> None:
+        with PRINT_LOCK:
+            sys.stderr.write("\r" + " " * 79 + "\r")
+            sys.stderr.flush()
+
+    def stop(self) -> float:
+        self._stop.set()
+        self._thread.join()
+        self.clear()
+        return self.elapsed
+
+
+def emit_row(n: int, total: int, element: str, rows, secs: float,
+             failed_rc: int | None = None) -> None:
+    with PRINT_LOCK:
+        sys.stderr.write(LINE.format(
+            n=f"{n}/{total}", el=element,
+            filas=f"rc{failed_rc}" if failed_rc else len(rows),
+            tiempo=f"{secs:.1f}s") + "\n")
+        sys.stderr.flush()
 
 
 def log(msg: str) -> None:
@@ -220,19 +285,23 @@ def read_input(path: str) -> list[str]:
 
 
 def execute(cfg: Config, elements: list[str]) -> tuple[list[list[str]], int]:
-    """SECUENCIAL: un elemento a la vez."""
+    """SECUENCIAL: un elemento a la vez, con cronometro en vivo."""
     rows: list[list[str]] = []
     failed = 0
     total = len(elements)
+    print(header(), file=sys.stderr, flush=True)
+
     for n, element in enumerate(elements, 1):
+        ticker = Ticker(f"{n}/{total}", element)
         rc, out = run_zowe(build_args(cfg, element), cfg.timeout)
+        elapsed = ticker.stop()
         if rc != 0:
-            log(f"WARN: [{n}/{total}] Fallo consulta elemento='{element}' rc={rc}")
+            emit_row(n, total, element, [], elapsed, failed_rc=rc)
             failed += 1
             continue
         found = parse_json(out)
         rows.extend(found)
-        log(f"INFO: [{n}/{total}] {element}: {len(found)} filas")
+        emit_row(n, total, element, found, elapsed)
     return rows, failed
 
 
@@ -258,16 +327,12 @@ def reconcile(elements: list[str], rows: list[list[str]]) -> list[list[str]]:
     return out
 
 
-def write_csv(rows: list[list[str]], delim: str, path: str | None) -> None:
-    fh = open(path, "w", newline="", encoding="utf-8") if path else sys.stdout
-    try:
+def write_csv(rows: list[list[str]], delim: str, path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh, delimiter=delim, lineterminator="\r\n",
                             quoting=csv.QUOTE_MINIMAL)
         writer.writerow(COLS)
         writer.writerows(rows)
-    finally:
-        if path:
-            fh.close()
 
 
 def main(argv: list[str]) -> int:
@@ -280,15 +345,16 @@ def main(argv: list[str]) -> int:
     arg2 = argv[1] if len(argv) > 1 else None
 
     started = datetime.now()
-    log(f"====== INICIO PROCESO : {started:%Y-%m-%d %H:%M:%S} ======")
+    t0 = time.monotonic()
 
+    stamp = started.strftime("%Y%m%d_%H%M%S")
     if isfile(arg1):
         elements = read_input(arg1)
-        stamp = started.strftime("%Y%m%d_%H%M%S")
-        output = arg2 or f"{splitext(basename(arg1))[0]}_{stamp}.csv"
+        base = splitext(basename(arg1))[0]
     else:
         elements = [arg1.upper()]
-        output = None  # stdout
+        base = elements[0]
+    output = arg2 or f"{base}_{stamp}.csv"
 
     if not elements:
         log("ERROR: No hay elementos validos en el archivo de entrada.")
@@ -314,16 +380,19 @@ def main(argv: list[str]) -> int:
 
     found = sum(1 for r in final if r[-1] == "FOUND")
     missing = sum(1 for r in final if r[-1] == "NOT_FOUND")
-    if output:
-        log(f"INFO: Archivo generado: {output}")
-    log(f"INFO: Filas con datos: {found} | Elementos no encontrados: {missing}")
-    if failed:
-        log(f"WARN: Consultas fallidas: {failed}/{len(elements)}")
+    elapsed = time.monotonic() - t0
 
-    ended = datetime.now()
-    elapsed = (ended - started).total_seconds()
-    log(f"====== FIN PROCESO    : {ended:%Y-%m-%d %H:%M:%S} "
-        f"({elapsed:.1f}s | {elapsed / len(elements):.1f}s por elemento) ======")
+    print(rule(), file=sys.stderr)
+    parts = [f"{len(elements)} elementos", f"{found} filas"]
+    if missing:
+        parts.append(f"{missing} no encontrado(s)")
+    if failed:
+        parts.append(f"{failed} FALLIDAS")
+    print(f"  {' | '.join(parts)}", file=sys.stderr)
+    print(f"  Tiempo total: {elapsed:.1f}s  "
+          f"({elapsed / len(elements):.1f}s por elemento)\n", file=sys.stderr)
+
+    log(f"Archivo generado: {abspath(output)}")
     return 4 if failed else 0
 
 
