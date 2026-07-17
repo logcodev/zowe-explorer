@@ -4,12 +4,20 @@ RecuperaEndevor_par.py - Inventario de elementos Endevor via Zowe CLI -> CSV
                          VERSION PARALELA: N consultas concurrentes.
 
 Autor   : Albert Tapia
-Version : 6.0
+Version : 9.0
 
 El input es una lista de NOMBRES DE ELEMENTO. El TYPE es un dato a
 descubrir, no un filtro: se consulta con --typ * y se reporta lo que venga.
 Un mismo elemento puede existir bajo varios types -> varias filas.
 Los elementos que no existen salen con STATUS=NOT_FOUND.
+
+Al arrancar pregunta por el ambiente:
+    Produccion    -> BCPPROD  stage 2
+    Certificacion -> BCPDCCAL stage 2
+    Desarrollo    -> BCPDESA  stage 1
+    Todos         -> sin filtro
+El prompt sale por stderr, asi que puedes responderlo con un pipe:
+    echo 2 | python RecuperaEndevor_par.py lista.txt
 
 Uso:
     RecuperaEndevor_par.py <archivo_input> [salida.csv]
@@ -17,10 +25,8 @@ Uso:
 
 Variables de entorno opcionales:
     ENDEVOR_TYPE            (default: *)   filtro de type, si lo conoces
-    ENDEVOR_LIMIT           (default: 0)   0 = NOLIMIT (filtramos en local)
+    ENDEVOR_LIMIT           (default: no se manda; el host esta en API v1)
     ENDEVOR_INSTANCE        (default: ENDEVOR)
-    ENDEVOR_ENVIRONMENT     (default: *)
-    ENDEVOR_STAGE           (default: *)
     ENDEVOR_SYSTEM          (default: *)
     ENDEVOR_SUBSYSTEM       (default: *)
     ENDEVOR_CSV_DELIM       (default: ;)
@@ -41,6 +47,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import OrderedDict, defaultdict
@@ -48,11 +55,40 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from os.path import basename, isfile, splitext
 
-FIELDS = ["elmName", "typeName", "envName", "stgId", "sysName",
-          "sbsName", "procGrpName", "signoutId", "lastActCcid", "lastActDate"]
+# El JSON de --rfj trae decenas de campos por elemento; estos son los que
+# van al CSV. (clave JSON, columna). Editar aqui es editar todo.
+# OJO: stgNum es el stage real (1|2). stgId es un id interno y devuelve
+# cosas como "4" -- el script original mapeaba ese por error.
+FIELD_MAP = [
+    ("elmName",       "ELEMENT"),
+    ("typeName",      "TYPE"),
+    ("envName",       "ENV"),
+    ("stgNum",        "STAGE"),
+    ("sysName",       "SYSTEM"),
+    ("sbsName",       "SUBSYSTEM"),
+    ("procGrpName",   "PROCGROUP"),
+    ("signoutId",     "SIGNOUT"),
+    ("lastActCcid",   "CCID"),
+    ("lastActUserid", "USERID"),
+    ("lastAct",       "ACCION"),
+    ("lastActDate",   "DATETIME"),
+]
 
-COLS = ["ELEMENT", "TYPE", "ENV", "STAGE", "SYSTEM", "SUBSYSTEM",
-        "PROCGROUP", "SIGNOUT", "CCID", "DATETIME", "STATUS"]
+KEYS = [k for k, _ in FIELD_MAP]
+COLS = [c for _, c in FIELD_MAP] + ["STATUS"]
+
+# Campos que Endevor devuelve en ISO y Excel no interpreta bien.
+DATE_KEYS = {"lastActDate"}
+
+# Ambientes Endevor de BCP: (etiqueta, --env, --sn). "" = no se manda el
+# flag. El stage va atado al ambiente segun el mapa del site.
+ENVIRONMENTS = [
+    ("Todos",          "",         ""),
+    ("Produccion",     "BCPPROD",  "2"),
+    ("Certificacion",  "BCPDCCAL", "2"),
+    ("Desarrollo",     "BCPDESA",  "1"),
+]
+ISO_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})")
 
 # Charset de FIELD_RE de la extension VSCode, menos los comodines (* %):
 # aqui cada nombre se cruza 1:1 contra la respuesta, y una mascara no
@@ -64,31 +100,54 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", file=sys.stderr, flush=True)
 
 
+def ask_environment() -> tuple[str, str]:
+    """Prompt de ambiente. Devuelve (env, stage). Todo va a stderr: en modo
+    individual el CSV sale por stdout y el prompt lo corromperia."""
+    print("\n  Que ambiente?", file=sys.stderr)
+    for i, (label, _, _) in enumerate(ENVIRONMENTS, 1):
+        print(f"    {i}) {label}", file=sys.stderr)
+    while True:
+        print("  Opcion [1]: ", end="", file=sys.stderr, flush=True)
+        try:
+            raw = input().strip() or "1"
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            log("INFO: Sin respuesta; se asume Todos.")
+            return "", ""
+        if raw.isdigit() and 1 <= int(raw) <= len(ENVIRONMENTS):
+            label, environment, stage = ENVIRONMENTS[int(raw) - 1]
+            log(f"INFO: Ambiente: {label}"
+                + (f" -> --env {environment} --sn {stage}" if environment else ""))
+            return environment, stage
+        print(f"    Opcion invalida (1-{len(ENVIRONMENTS)}).", file=sys.stderr)
+
+
 class Config:
     def __init__(self) -> None:
         env = os.environ.get
         self.instance = env("ENDEVOR_INSTANCE", "ENDEVOR")
         self.type = env("ENDEVOR_TYPE", "*")
-        # El help documenta 0=NOLIMIT pero NO el default. Explicito siempre:
-        # filtramos en local, asi que cualquier tope solo trunca en silencio.
-        self.limit = env("ENDEVOR_LIMIT", "0")
-        self.environment = env("ENDEVOR_ENVIRONMENT", "*")
-        self.stage = env("ENDEVOR_STAGE", "*")
+        # El host responde con la API REST v1 (modo compatibilidad), donde
+        # --limit puede no existir. Opt-in: por defecto no se manda.
+        self.limit = env("ENDEVOR_LIMIT", "")
+        self.environment = ""  # lo define el prompt
+        self.stage = ""  # lo define el prompt, atado al ambiente
         self.system = env("ENDEVOR_SYSTEM", "*")
         self.subsystem = env("ENDEVOR_SUBSYSTEM", "*")
         self.delim = env("ENDEVOR_CSV_DELIM", ";")
         self.timeout = int(env("ENDEVOR_TIMEOUT", "300"))
         self.workers = int(env("ENDEVOR_WORKERS", "4"))
 
-    @property
-    def wildcards(self) -> bool:
-        return "*" in (self.type, self.environment, self.stage,
-                       self.system, self.subsystem)
+# En Windows zowe es un shim .cmd y CreateProcess solo resuelve .exe:
+# subprocess no lo encuentra por mas que el PATH este bien. shutil.which
+# honra PATHEXT y devuelve la ruta completa al .cmd. En Linux/WSL es un
+# no-op que devuelve la misma ruta que resolveria el shell.
+ZOWE = shutil.which("zowe") or "zowe"
 
 
 def run_zowe(args: list[str], timeout: int) -> tuple[int, str]:
     try:
-        p = subprocess.run(["zowe", *args], capture_output=True, text=True,
+        p = subprocess.run([ZOWE, *args], capture_output=True, text=True,
                            timeout=timeout, encoding="utf-8", errors="replace")
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
@@ -98,23 +157,18 @@ def run_zowe(args: list[str], timeout: int) -> tuple[int, str]:
 
 
 def build_args(cfg: Config, element: str) -> list[str]:
-    args = ["endevor", "list", "elements", element,
-            "--typ", cfg.type,
-            "-i", cfg.instance,
-            "--env", cfg.environment,
-            "--sn", cfg.stage,
-            "--sys", cfg.system,
-            "--sub", cfg.subsystem,
-            "--ret", "all",
-            "--dat", "all",
-            "--sm",
-            "--rff", *FIELDS,
-            "--limit", cfg.limit,
-            "--rfj"]
-    # --sea (search) no admite comodines en los niveles del mapa.
-    # --search-limit solo aplica cuando se busca por el mapa.
-    if not cfg.wildcards:
-        args += ["--sea", "--search-limit", cfg.limit]
+    """El minimo probado. Un filtro en '*' no se manda: omitirlo ya significa
+    'todos', y --rff sobra porque filtra la tabla, no el 'data' del JSON."""
+    args = ["endevor", "list", "elements", element, "-i", cfg.instance, "--rfj"]
+    for flag, value in (("--typ", cfg.type),
+                        ("--env", cfg.environment),
+                        ("--sn", cfg.stage),
+                        ("--sys", cfg.system),
+                        ("--sub", cfg.subsystem)):
+        if value and value != "*":
+            args += [flag, value]
+    if cfg.limit:
+        args += ["--limit", cfg.limit]
     return args
 
 
@@ -132,13 +186,26 @@ def _walk(node) -> "list[dict]":
     return found
 
 
+def fmt_date(value: str) -> str:
+    """2018-05-17T15:54:00.00+0000 -> 2018-05-17 15:54:00"""
+    m = ISO_RE.match(value)
+    return f"{m.group(1)} {m.group(2)}" if m else value
+
+
 def parse_json(text: str) -> list[list[str]]:
     try:
         doc = json.loads(text)
     except json.JSONDecodeError:
         log("WARN: La respuesta de --rfj no es JSON valido.")
         return []
-    return [[str(o.get(f) or "").strip() for f in FIELDS] for o in _walk(doc)]
+    rows = []
+    for obj in _walk(doc):
+        row = []
+        for key in KEYS:
+            value = str(obj.get(key) or "").strip()
+            row.append(fmt_date(value) if key in DATE_KEYS else value)
+        rows.append(row)
+    return rows
 
 
 def read_input(path: str) -> list[str]:
@@ -198,7 +265,7 @@ def reconcile(elements: list[str], rows: list[list[str]]) -> list[list[str]]:
         if matches:
             out.extend([*row, "FOUND"] for row in matches)
         else:
-            out.append([name, *[""] * 9, "NOT_FOUND"])
+            out.append([name, *[""] * (len(KEYS) - 1), "NOT_FOUND"])
     return out
 
 
@@ -237,6 +304,8 @@ def main(argv: list[str]) -> int:
     if not elements:
         log("ERROR: No hay elementos validos en el archivo de entrada.")
         return 2
+
+    cfg.environment, cfg.stage = ask_environment()
 
     log(f"INFO: {len(elements)} elementos | modo paralelo ({cfg.workers} workers)")
 
