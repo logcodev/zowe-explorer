@@ -210,15 +210,56 @@ class Config:
 ZOWE = shutil.which("zowe") or "zowe"
 
 
+# En Windows, subprocess.run(timeout=) mata solo el proceso lanzado (el .cmd),
+# no el node hijo que abre la conexion al host: ese queda huerfano y colgado.
+# Con un grupo de procesos propio podemos matar el arbol entero al vencer.
+if os.name == "nt":
+    _POPEN_KW = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+
+    def _kill_tree(proc):
+        # taskkill /T mata el proceso y toda su descendencia.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+else:
+    _POPEN_KW = {"start_new_session": True}
+
+    def _kill_tree(proc):
+        import signal
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            time.sleep(0.5)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def run_zowe(args: list[str], timeout: int) -> tuple[int, str]:
     try:
-        p = subprocess.run([ZOWE, *args], capture_output=True, text=True,
-                           timeout=timeout, encoding="utf-8", errors="replace")
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except subprocess.TimeoutExpired:
-        return 124, f"timeout tras {timeout}s"
+        proc = subprocess.Popen([ZOWE, *args], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", **_POPEN_KW)
     except OSError as exc:
         return 126, str(exc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, (out or "") + (err or "")
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return 124, f"timeout tras {timeout}s (proceso terminado)"
+
+
+def run_zowe_retry(args: list[str], timeout: int, retries: int = 1) -> tuple[int, str]:
+    """Reintenta una vez ante timeout o fallo transitorio de arranque."""
+    rc, out = run_zowe(args, timeout)
+    attempt = 0
+    while rc in (124, 126) and attempt < retries:
+        attempt += 1
+        rc, out = run_zowe(args, timeout)
+    return rc, out
 
 
 def build_args(cfg: Config, element: str) -> list[str]:
@@ -291,25 +332,27 @@ def read_input(path: str) -> list[str]:
     return list(elements)
 
 
-def execute(cfg: Config, elements: list[str]) -> tuple[list[list[str]], int]:
-    """PARALELO: cfg.workers a la vez. Las filas salen en orden de termino,
-    no de input; reconcile() reordena despues para el CSV. El cronometro es
-    global: con N en vuelo, uno por elemento se pelearia por la misma linea.
-    El TIEMPO de cada fila si es el de su propia consulta."""
-    rows: list[list[str]] = []
+def execute(cfg: Config, elements: list[str], sink: CsvSink) -> int:
+    """PARALELO: cfg.workers a la vez. Cada resultado se escribe al CSV en
+    cuanto llega (orden de termino); el sink hace flush por fila, asi que un
+    Ctrl+C o timeout conserva lo ya consultado. main() reordena al cerrar.
+    Nota: los threads ya en vuelo al momento del Ctrl+C terminan su zowe
+    (o su timeout) antes de soltar; lo escrito antes esta a salvo igual."""
     failed = 0
     total = len(elements)
     print(header(), file=sys.stderr, flush=True)
 
     def task(element: str):
         t = time.monotonic()
-        rc, out = run_zowe(build_args(cfg, element), cfg.timeout)
+        rc, out = run_zowe_retry(build_args(cfg, element), cfg.timeout)
         return element, rc, out, time.monotonic() - t
 
     ticker = Ticker("...", f"{cfg.workers} en vuelo")
     done = 0
-    with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-        for future in as_completed([pool.submit(task, e) for e in elements]):
+    pool = ThreadPoolExecutor(max_workers=cfg.workers)
+    futures = [pool.submit(task, e) for e in elements]
+    try:
+        for future in as_completed(futures):
             element, rc, out, secs = future.result()
             done += 1
             ticker.clear()
@@ -318,10 +361,15 @@ def execute(cfg: Config, elements: list[str]) -> tuple[list[list[str]], int]:
                 failed += 1
                 continue
             found = parse_json(out)
-            rows.extend(found)
+            sink.add(found)
             emit_row(done, total, element, found, secs)
+    except KeyboardInterrupt:
+        ticker.stop()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
     ticker.stop()
-    return rows, failed
+    pool.shutdown(wait=True)
+    return failed
 
 
 def reconcile(elements: list[str], rows: list[list[str]]) -> list[list[str]]:
@@ -346,11 +394,61 @@ def reconcile(elements: list[str], rows: list[list[str]]) -> list[list[str]]:
     return out
 
 
-def write_csv(rows: list[list[str]], delim: str, path: str) -> None:
+class CsvSink:
+    """Escribe el CSV a medida que llegan las filas y hace flush por cada una,
+    para que un Ctrl+C, un timeout o un cuelgue no pierdan lo ya recolectado.
+    Registra que elementos produjeron datos; los que no, se emiten como
+    NOT_FOUND al cerrar."""
+
+    def __init__(self, path: str, delim: str):
+        self.path = path
+        self.fh = open(path, "w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.fh, delimiter=delim, lineterminator="\r\n",
+                                 quoting=csv.QUOTE_MINIMAL)
+        self.writer.writerow(COLS)
+        self.fh.flush()
+        self.seen: set[str] = set()
+        self.rows_written = 0
+
+    def add(self, rows: list[list[str]]) -> None:
+        for row in rows:
+            self.writer.writerow([*row, "FOUND"])
+            self.seen.add(row[0].upper())
+            self.rows_written += 1
+        if rows:
+            self.fh.flush()
+
+    def finish_missing(self, elements: list[str]) -> int:
+        """Cierra el CSV agregando NOT_FOUND para lo que nunca aparecio."""
+        missing = 0
+        for name in elements:
+            if name not in self.seen:
+                self.writer.writerow([name, *[""] * (len(KEYS) - 1), "NOT_FOUND"])
+                missing += 1
+        self.fh.flush()
+        return missing
+
+    def close(self) -> None:
+        if not self.fh.closed:
+            self.fh.close()
+
+
+def reorder_csv(path: str, elements: list[str], delim: str) -> None:
+    """Reordena el CSV de orden-de-termino a orden-de-input. Best-effort:
+    ante cualquier fallo, el CSV desordenado ya es valido y se deja igual."""
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh, delimiter=delim)
+            header_row = next(reader)
+            rows = list(reader)
+    except (OSError, StopIteration):
+        return
+    order = {name: i for i, name in enumerate(elements)}
+    rows.sort(key=lambda r: order.get(r[0].upper(), len(order)))
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh, delimiter=delim, lineterminator="\r\n",
                             quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(COLS)
+        writer.writerow(header_row)
         writer.writerows(rows)
 
 
@@ -383,28 +481,29 @@ def main(argv: list[str]) -> int:
 
     log(f"INFO: {len(elements)} elementos | modo paralelo ({cfg.workers} workers)")
 
-    rows, failed = execute(cfg, elements)
+    sink = CsvSink(output, cfg.delim)
+    interrupted = False
+    failed = 0
+    try:
+        failed = execute(cfg, elements, sink)
+    except KeyboardInterrupt:
+        interrupted = True
+        print(file=sys.stderr)
+        log("INTERRUMPIDO: guardando lo recolectado hasta ahora...")
+    finally:
+        missing = sink.finish_missing(elements)
+        found = sink.rows_written
+        sink.close()
+        # en paralelo el CSV quedo en orden de termino; reordenar a orden de
+        # input solo si termino entero (si se corto, dejar lo que hay).
+        if not interrupted:
+            reorder_csv(output, elements, cfg.delim)
 
-    if failed and failed == len(elements):
-        log(f"ERROR: Fallaron todas las consultas ({failed}/{len(elements)}).")
-        log("Sugerencia: valida perfiles Zowe/Endevor y ENDEVOR_INSTANCE.")
-        return 8
-
-    if not rows and not failed:
-        log("WARN: Cero filas en todas las consultas. Si esperabas datos,")
-        log("      revisa que el JSON de --rfj traiga objetos con elmName.")
-
-    final = reconcile(elements, rows)
-    write_csv(final, cfg.delim, output)
-
-    found = sum(1 for r in final if r[-1] == "FOUND")
-    missing = sum(1 for r in final if r[-1] == "NOT_FOUND")
     elapsed = time.monotonic() - t0
-
     print(rule(), file=sys.stderr)
     parts = [f"{len(elements)} elementos", f"{found} filas"]
     if missing:
-        parts.append(f"{missing} no encontrado(s)")
+        parts.append(f"{missing} sin datos")
     if failed:
         parts.append(f"{failed} FALLIDAS")
     print(f"  {' | '.join(parts)}", file=sys.stderr)
@@ -412,6 +511,9 @@ def main(argv: list[str]) -> int:
           f"({elapsed / len(elements):.1f}s por elemento)\n", file=sys.stderr)
 
     log(f"Archivo generado: {abspath(output)}")
+    if interrupted:
+        log("NOTA: corrida incompleta; el CSV tiene solo lo consultado antes del corte.")
+        return 130
     return 4 if failed else 0
 
 
